@@ -57,10 +57,15 @@ export function validateServerEnv(env: Record<string, string | undefined>): EnvR
   if (!env["MAIL_PROVIDER"]) {
     warnings.push("MAIL_PROVIDER is not set: email-sending flows (password reset) will fail.");
   }
-  if (!env["MEDICAL_UPLOAD_DIR"]) {
-    warnings.push(
-      "MEDICAL_UPLOAD_DIR is not set: uploads use ./private-uploads, which is lost on ephemeral hosts.",
-    );
+  const storageDriver = env["STORAGE_DRIVER"]?.trim().toLowerCase();
+  if (storageDriver !== "r2") {
+    errors.push("STORAGE_DRIVER must be r2 in production (local disk is ephemeral).");
+  } else {
+    for (const name of ["R2_ENDPOINT", "R2_BUCKET", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]) {
+      if (!env[name]) errors.push(`${name} is required when STORAGE_DRIVER=r2.`);
+    }
+    const endpoint = env["R2_ENDPOINT"];
+    if (endpoint && !endpoint.startsWith("https://")) errors.push("R2_ENDPOINT must use https://.");
   }
   return { errors, warnings };
 }
