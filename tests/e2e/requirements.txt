@@ -1,0 +1,5 @@
+# Python dependencies for the browser E2E suite (npm run test:e2e).
+#   pip install -r tests/e2e/requirements.txt
+#   python -m playwright install chromium
+playwright>=1.45
+psycopg[binary]>=3.1

@@ -1,0 +1,149 @@
+name: CI
+
+# What runs where
+#   verify : the deterministic gate — migration integrity, typecheck, lint, production build, unit tests,
+#            a REAL `drizzle-kit migrate` + seed from an empty database, and the PostgreSQL integration suites.
+#   e2e    : browser end-to-end (Playwright + the real app + PostgreSQL). Kept as its own job because it needs
+#            Python + a browser download and is the slowest part; a flaky browser must not hide the verify signal.
+#
+# No repository secrets are used. The PostgreSQL credentials below belong to a throwaway service container that
+# exists only for the duration of the job (they are not secrets and protect nothing). Your production database
+# URL is never needed or referenced by CI.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  PG_USER: postgres
+  PG_PASSWORD: ci-throwaway-password
+  PG_HOST: localhost
+  PG_PORT: "5432"
+
+jobs:
+  verify:
+    name: Verify (typecheck · lint · build · unit · integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-throwaway-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Disposable test database: its name contains "test" and `test:db:setup` creates it + marks it with the
+      # sentinel table that the fail-closed test guard requires.
+      TEST_DATABASE_URL: postgres://postgres:ci-throwaway-password@localhost:5432/medix_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Migration integrity (journal, files, snapshots, ordering, schema drift)
+        run: npm run db:check
+
+      - name: Typecheck (app + tests + scripts)
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Production build
+        run: npm run build
+
+      - name: Unit tests (no database)
+        run: npm run test:unit
+
+      - name: Real migration from an empty database (drizzle-kit migrate, then seed)
+        env:
+          DATABASE_URL: postgres://postgres:ci-throwaway-password@localhost:5432/medix_migrate_check
+        run: |
+          PGPASSWORD="$PG_PASSWORD" psql -h "$PG_HOST" -U "$PG_USER" -d postgres -c 'CREATE DATABASE medix_migrate_check'
+          npm run db:migrate
+          npm run db:seed
+          # Re-running must be a no-op (idempotent).
+          npm run db:migrate
+          npm run db:seed
+
+      - name: Prepare disposable test database (create, migrate, seed)
+        run: npm run test:db:setup
+
+      - name: Integration tests (real PostgreSQL)
+        run: npm run test:integration
+
+  e2e:
+    name: Browser E2E (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-throwaway-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:ci-throwaway-password@localhost:5432/medix_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/e2e/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          python -m pip install -r tests/e2e/requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run E2E (the runner sets up the DB, builds, starts the app and stops it)
+        run: npm run test:e2e
+
+      - name: Upload server log and failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            .test-run/server.log
+            .test-run/screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
